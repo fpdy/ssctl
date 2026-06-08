@@ -1,6 +1,7 @@
 use std::path::PathBuf;
+use std::{fmt, str::FromStr};
 
-use clap::{ArgGroup, Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(name = "ssctl", version, about = "Superset session control helper")]
@@ -25,6 +26,7 @@ pub enum Command {
     Sessions(OutputArgs),
     Spawn(SpawnArgs),
     Send(SendArgs),
+    Close(CloseArgs),
     Handoff(HandoffArgs),
     Report(ReportArgs),
 }
@@ -112,6 +114,69 @@ pub struct SendArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("target")
+        .required(true)
+        .multiple(false)
+        .args(["role", "session"])
+))]
+pub struct CloseArgs {
+    #[arg(long, group = "target")]
+    pub role: Option<String>,
+
+    #[arg(long, group = "target", value_name = "SESSION_ID")]
+    pub session: Option<String>,
+
+    #[arg(long)]
+    pub force_unregistered_session: bool,
+
+    #[arg(long)]
+    pub dry_run: bool,
+
+    #[arg(long)]
+    pub json: bool,
+
+    #[arg(long, value_name = "WORKSPACE_ID")]
+    pub workspace: Option<String>,
+
+    #[arg(long, value_enum, ignore_case = true, default_value_t = CloseSignal::Sighup)]
+    pub signal: CloseSignal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CloseSignal {
+    Sighup,
+    Sigint,
+    Sigterm,
+    Sigkill,
+}
+
+impl CloseSignal {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sighup => "SIGHUP",
+            Self::Sigint => "SIGINT",
+            Self::Sigterm => "SIGTERM",
+            Self::Sigkill => "SIGKILL",
+        }
+    }
+}
+
+impl fmt::Display for CloseSignal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for CloseSignal {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        <Self as ValueEnum>::from_str(value, true).map_err(|error| error.to_string())
+    }
+}
+
+#[derive(Debug, Args)]
 pub struct HandoffArgs {
     #[arg(long)]
     pub to: String,
@@ -133,7 +198,7 @@ pub struct ReportArgs {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command};
+    use super::{Cli, CloseSignal, Command};
 
     #[test]
     fn parses_phase_one_commands() {
@@ -166,5 +231,27 @@ mod tests {
     fn send_accepts_one_target_and_one_input() {
         let result = Cli::try_parse_from(["ssctl", "send", "--role", "worker", "--stdin"]);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn close_accepts_role_and_signal() {
+        let cli = Cli::parse_from([
+            "ssctl", "close", "--role", "worker", "--signal", "SIGTERM", "--json",
+        ]);
+
+        match cli.command {
+            Command::Close(args) => {
+                assert_eq!(args.role.as_deref(), Some("worker"));
+                assert_eq!(args.signal, CloseSignal::Sigterm);
+                assert!(args.json);
+            }
+            _ => panic!("expected close command"),
+        }
+    }
+
+    #[test]
+    fn close_requires_a_target() {
+        let result = Cli::try_parse_from(["ssctl", "close"]);
+        assert!(result.is_err());
     }
 }

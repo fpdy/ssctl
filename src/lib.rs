@@ -4,6 +4,7 @@ pub mod config;
 pub mod registry;
 pub mod resolver;
 pub mod superset_cli;
+pub mod superset_runtime;
 pub mod terminal_host;
 pub mod transport;
 

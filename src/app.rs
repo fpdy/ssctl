@@ -10,8 +10,8 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::cli::{
-    AgentsCommand, AgentsListArgs, Cli, Command, HandoffArgs, OutputArgs, ReportArgs, SendArgs,
-    SpawnArgs,
+    AgentsCommand, AgentsListArgs, Cli, CloseArgs, Command, HandoffArgs, OutputArgs, ReportArgs,
+    SendArgs, SpawnArgs,
 };
 use crate::config::RuntimeConfig;
 use crate::registry::{
@@ -20,6 +20,10 @@ use crate::registry::{
 };
 use crate::resolver::{SpawnResolution, resolve_spawned_session};
 use crate::superset_cli::{CommandOutput, SupersetCliAdapter};
+use crate::superset_runtime::{
+    PtyDaemonHello, SupersetHostRuntime, SupersetRuntimeClient, host_db_path,
+    load_pty_daemon_manifest, pty_daemon_manifest_path, runtime_from_status_stdout,
+};
 use crate::terminal_host::{
     HelloResponse, TerminalHostClient, TerminalHostPaths, TerminalSessionInfo,
 };
@@ -39,6 +43,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Sessions(args) => sessions(&config, args),
         Command::Spawn(args) => spawn(&config, args),
         Command::Send(args) => send(&config, args),
+        Command::Close(args) => close(&config, args),
         Command::Handoff(args) => handoff(&config, args),
         Command::Report(args) => report(&config, args),
     }
@@ -48,9 +53,11 @@ fn status(config: &RuntimeConfig, args: OutputArgs) -> Result<()> {
     let adapter = SupersetCliAdapter::new(config.superset_bin.clone());
     let cli_report = inspect_superset_cli(&adapter);
     let terminal_host_report = inspect_terminal_host(config);
+    let pty_daemon_report = inspect_pty_daemon(config, cli_report.status.as_ref());
     let report = StatusReport {
         superset_cli: cli_report,
         terminal_host: terminal_host_report,
+        pty_daemon: pty_daemon_report,
     };
 
     if args.json {
@@ -69,7 +76,9 @@ fn agents_list(config: &RuntimeConfig, args: AgentsListArgs) -> Result<()> {
 }
 
 fn sessions(config: &RuntimeConfig, args: OutputArgs) -> Result<()> {
-    let mut client = connect_terminal_host(config)?;
+    let adapter = SupersetCliAdapter::new(config.superset_bin.clone());
+    let runtime = ensure_superset_host_running(&adapter)?;
+    let mut client = connect_superset_runtime(config, &runtime)?;
     let sessions = client.list_sessions()?;
 
     if args.json {
@@ -85,14 +94,15 @@ fn spawn(config: &RuntimeConfig, args: SpawnArgs) -> Result<()> {
     let store = RegistryStore::new(config.registry_dir.clone());
     let _lock = store.acquire_lock()?;
     let adapter = SupersetCliAdapter::new(config.superset_bin.clone());
-    ensure_superset_host_running(&adapter)?;
+    let runtime = ensure_superset_host_running(&adapter)?;
 
-    let mut client = connect_terminal_host(config)?;
+    let mut client = connect_superset_runtime(config, &runtime)?;
     let before = client.list_sessions()?;
     let mut registry = load_spawn_registry(&store, &args.role, &before)?;
     let prompt = read_file_or_text(&args.prompt)?;
     let output = adapter.agents_create(&args.workspace, &args.agent, &prompt)?;
     ensure_command_success(&output, "superset agents create")?;
+    ensure_terminal_agent_create_stdout(&output.stdout)?;
 
     let (after, resolution) =
         poll_spawn_resolution(&mut client, &before, &args.workspace, &output.stdout)?;
@@ -147,9 +157,7 @@ fn load_spawn_registry(
 }
 
 fn send(config: &RuntimeConfig, args: SendArgs) -> Result<()> {
-    if args.force_unregistered_session && args.role.is_some() {
-        bail!("--force-unregistered-session is only valid with --session");
-    }
+    ensure_force_unregistered_session_usage(args.role.as_deref(), args.force_unregistered_session)?;
 
     let body = read_send_body(&args)?;
     let source_path = args.file.as_deref();
@@ -164,7 +172,7 @@ fn send(config: &RuntimeConfig, args: SendArgs) -> Result<()> {
     send_prepared(
         config,
         &store,
-        SendRequest {
+        SessionTargetRequest {
             role: args.role.as_deref(),
             session: args.session.as_deref(),
             force_unregistered_session: args.force_unregistered_session,
@@ -174,6 +182,32 @@ fn send(config: &RuntimeConfig, args: SendArgs) -> Result<()> {
         prepared,
     )
     .map(|_| ())
+}
+
+fn close(config: &RuntimeConfig, args: CloseArgs) -> Result<()> {
+    ensure_force_unregistered_session_usage(args.role.as_deref(), args.force_unregistered_session)?;
+
+    let store = RegistryStore::new(config.registry_dir.clone());
+    let output = close_session(
+        config,
+        &store,
+        SessionTargetRequest {
+            role: args.role.as_deref(),
+            session: args.session.as_deref(),
+            force_unregistered_session: args.force_unregistered_session,
+            workspace: args.workspace.as_deref(),
+            dry_run: args.dry_run,
+        },
+        args.signal.as_str(),
+    )?;
+
+    if args.json {
+        print_json(&output)?;
+    } else {
+        print_close_human(&output);
+    }
+
+    Ok(())
 }
 
 fn handoff(config: &RuntimeConfig, args: HandoffArgs) -> Result<()> {
@@ -190,7 +224,7 @@ fn handoff(config: &RuntimeConfig, args: HandoffArgs) -> Result<()> {
     let output = send_prepared(
         config,
         &store,
-        SendRequest {
+        SessionTargetRequest {
             role: Some(&args.to),
             session: None,
             force_unregistered_session: false,
@@ -226,7 +260,7 @@ fn report(config: &RuntimeConfig, args: ReportArgs) -> Result<()> {
     let output = send_prepared(
         config,
         &store,
-        SendRequest {
+        SessionTargetRequest {
             role: Some(&args.to),
             session: None,
             force_unregistered_session: false,
@@ -244,6 +278,7 @@ fn report(config: &RuntimeConfig, args: ReportArgs) -> Result<()> {
 struct StatusReport {
     superset_cli: SupersetCliStatus,
     terminal_host: TerminalHostStatus,
+    pty_daemon: PtyDaemonStatus,
 }
 
 #[derive(Debug, Serialize)]
@@ -262,6 +297,21 @@ struct TerminalHostStatus {
     socket_exists: bool,
     token_exists: bool,
     hello: Option<HelloResponse>,
+    session_count: Option<usize>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PtyDaemonStatus {
+    organization_id: Option<String>,
+    manifest: String,
+    socket: Option<String>,
+    host_db: Option<String>,
+    manifest_exists: bool,
+    socket_exists: bool,
+    host_db_exists: bool,
+    hello: Option<PtyDaemonHello>,
     session_count: Option<usize>,
     error: Option<String>,
 }
@@ -292,7 +342,7 @@ enum SnapshotPolicy {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct SendRequest<'a> {
+struct SessionTargetRequest<'a> {
     role: Option<&'a str>,
     session: Option<&'a str>,
     force_unregistered_session: bool,
@@ -301,7 +351,7 @@ struct SendRequest<'a> {
 }
 
 #[derive(Debug, Clone)]
-struct SendTarget {
+struct SessionTarget {
     role: Option<String>,
     registered_role: Option<String>,
     session_id: String,
@@ -321,6 +371,19 @@ struct SendOutput {
     byte_size: usize,
     payload_hash: String,
     pointer_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CloseOutput {
+    role: Option<String>,
+    session_id: String,
+    workspace_id: String,
+    registered: bool,
+    dry_run: bool,
+    closed: bool,
+    signal: String,
+    registry_updated: bool,
 }
 
 fn inspect_superset_cli(adapter: &SupersetCliAdapter) -> SupersetCliStatus {
@@ -389,21 +452,88 @@ fn inspect_terminal_host(config: &RuntimeConfig) -> TerminalHostStatus {
     status
 }
 
+fn inspect_pty_daemon(
+    config: &RuntimeConfig,
+    superset_status: Option<&CommandOutput>,
+) -> PtyDaemonStatus {
+    let mut status = PtyDaemonStatus {
+        organization_id: None,
+        manifest: "-".to_owned(),
+        socket: None,
+        host_db: None,
+        manifest_exists: false,
+        socket_exists: false,
+        host_db_exists: false,
+        hello: None,
+        session_count: None,
+        error: None,
+    };
+
+    let Some(superset_status) = superset_status else {
+        status.error = Some("superset status is unavailable".to_owned());
+        return status;
+    };
+    if !superset_status.success {
+        status.error = Some("superset status failed".to_owned());
+        return status;
+    }
+
+    let runtime = match runtime_from_status_stdout(&superset_status.stdout) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            status.error = Some(error.to_string());
+            return status;
+        }
+    };
+
+    let manifest_path = pty_daemon_manifest_path(&config.superset_home, &runtime.organization_id);
+    let host_db = host_db_path(&config.superset_home, &runtime.organization_id);
+    status.organization_id = Some(runtime.organization_id.clone());
+    status.manifest = manifest_path.display().to_string();
+    status.host_db = Some(host_db.display().to_string());
+    status.manifest_exists = manifest_path.exists();
+    status.host_db_exists = host_db.exists();
+
+    let manifest = match load_pty_daemon_manifest(&config.superset_home, &runtime.organization_id) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            status.error = Some(error.to_string());
+            return status;
+        }
+    };
+
+    status.socket = Some(manifest.socket_path.display().to_string());
+    status.socket_exists = manifest.socket_path.exists();
+
+    match connect_superset_runtime(config, &runtime) {
+        Ok(mut client) => {
+            status.hello = Some(client.hello().clone());
+            match client.list_sessions() {
+                Ok(sessions) => status.session_count = Some(sessions.len()),
+                Err(error) => status.error = Some(error.to_string()),
+            }
+        }
+        Err(error) => status.error = Some(error.to_string()),
+    }
+
+    status
+}
+
 fn send_prepared(
     config: &RuntimeConfig,
     store: &RegistryStore,
-    request: SendRequest<'_>,
+    request: SessionTargetRequest<'_>,
     prepared: PreparedMessage,
 ) -> Result<SendOutput> {
     let _lock = store.acquire_lock()?;
     let adapter = SupersetCliAdapter::new(config.superset_bin.clone());
-    ensure_superset_host_running(&adapter)?;
+    let runtime = ensure_superset_host_running(&adapter)?;
 
-    let mut client = connect_terminal_host(config)?;
+    let mut client = connect_superset_runtime(config, &runtime)?;
     let sessions = client.list_sessions()?;
     let mut registry = store.load()?;
     let cleanup = cleanup_stale_sessions(&mut registry, &sessions);
-    let target = resolve_send_target(request, &registry, &sessions)?;
+    let target = resolve_session_target(request, &registry, &sessions)?;
 
     let output = SendOutput {
         role: target.role.clone(),
@@ -450,11 +580,52 @@ fn send_prepared(
     Ok(output)
 }
 
-fn resolve_send_target(
-    request: SendRequest<'_>,
+fn close_session(
+    config: &RuntimeConfig,
+    store: &RegistryStore,
+    request: SessionTargetRequest<'_>,
+    signal: &str,
+) -> Result<CloseOutput> {
+    let _lock = store.acquire_lock()?;
+    let adapter = SupersetCliAdapter::new(config.superset_bin.clone());
+    let runtime = ensure_superset_host_running(&adapter)?;
+
+    let mut client = connect_superset_runtime(config, &runtime)?;
+    let sessions = client.list_sessions()?;
+    let mut registry = store.load()?;
+    let cleanup = cleanup_stale_sessions(&mut registry, &sessions);
+    let target = resolve_session_target(request, &registry, &sessions)?;
+    let registry_updated = apply_close_registry_update(&mut registry, &target, request.dry_run)?;
+
+    let output = CloseOutput {
+        role: target.role.clone(),
+        session_id: target.session_id.clone(),
+        workspace_id: target.workspace_id.clone(),
+        registered: target.registered,
+        dry_run: request.dry_run,
+        closed: !request.dry_run,
+        signal: signal.to_owned(),
+        registry_updated,
+    };
+
+    if request.dry_run {
+        return Ok(output);
+    }
+
+    client.close(&target.session_id, signal)?;
+
+    if registry_updated || cleanup.removed_roles > 0 {
+        store.save(&registry)?;
+    }
+
+    Ok(output)
+}
+
+fn resolve_session_target(
+    request: SessionTargetRequest<'_>,
     registry: &Registry,
     sessions: &[TerminalSessionInfo],
-) -> Result<SendTarget> {
+) -> Result<SessionTarget> {
     match (request.role, request.session) {
         (Some(role), None) => {
             let entry = registry
@@ -462,7 +633,7 @@ fn resolve_send_target(
                 .get(role)
                 .with_context(|| format!("role '{role}' is not registered"))?;
             let session = verified_registered_session(entry, sessions)?;
-            Ok(SendTarget {
+            Ok(SessionTarget {
                 role: Some(role.to_owned()),
                 registered_role: Some(role.to_owned()),
                 session_id: entry.session_id.clone(),
@@ -476,7 +647,7 @@ fn resolve_send_target(
         (None, Some(session_id)) => {
             if let Some((role, entry)) = role_for_session(registry, session_id) {
                 let session = verified_registered_session(entry, sessions)?;
-                return Ok(SendTarget {
+                return Ok(SessionTarget {
                     role: Some(role.to_owned()),
                     registered_role: Some(role.to_owned()),
                     session_id: session_id.to_owned(),
@@ -501,7 +672,7 @@ fn resolve_send_target(
             if session.workspace_id.as_deref() != Some(workspace) {
                 bail!("forced session workspace does not match --workspace");
             }
-            Ok(SendTarget {
+            Ok(SessionTarget {
                 role: None,
                 registered_role: None,
                 session_id: session_id.to_owned(),
@@ -511,6 +682,32 @@ fn resolve_send_target(
         }
         _ => bail!("exactly one of --role or --session is required"),
     }
+}
+
+fn ensure_force_unregistered_session_usage(role: Option<&str>, force: bool) -> Result<()> {
+    if force && role.is_some() {
+        bail!("--force-unregistered-session is only valid with --session");
+    }
+    Ok(())
+}
+
+fn apply_close_registry_update(
+    registry: &mut Registry,
+    target: &SessionTarget,
+    dry_run: bool,
+) -> Result<bool> {
+    if dry_run {
+        return Ok(false);
+    }
+
+    let Some(role) = &target.registered_role else {
+        return Ok(false);
+    };
+    registry
+        .roles
+        .remove(role)
+        .with_context(|| format!("registered close target '{role}' disappeared"))?;
+    Ok(true)
 }
 
 fn verified_registered_session<'a>(
@@ -583,7 +780,7 @@ fn prepare_structured_message(
 }
 
 fn poll_spawn_resolution(
-    client: &mut TerminalHostClient,
+    client: &mut SupersetRuntimeClient,
     before: &[TerminalSessionInfo],
     workspace_id: &str,
     cli_stdout: &str,
@@ -606,17 +803,17 @@ fn poll_spawn_resolution(
     if let Some(error) = last_error {
         Err(error)
     } else {
-        bail!("could not inspect terminal-host sessions after spawn; registry was not updated");
+        bail!("could not inspect pty-daemon sessions after spawn; registry was not updated");
     }
     .with_context(|| {
         format!(
-            "last terminal-host session count after spawn: {}",
+            "last pty-daemon session count after spawn: {}",
             last_sessions.len()
         )
     })
 }
 
-fn ensure_superset_host_running(adapter: &SupersetCliAdapter) -> Result<()> {
+fn ensure_superset_host_running(adapter: &SupersetCliAdapter) -> Result<SupersetHostRuntime> {
     let output = adapter.status(true)?;
     ensure_command_success(&output, "superset status")?;
 
@@ -632,6 +829,24 @@ fn ensure_superset_host_running(adapter: &SupersetCliAdapter) -> Result<()> {
         .unwrap_or(false);
     if !running || !healthy {
         bail!("Superset host is not running and healthy");
+    }
+    runtime_from_status_stdout(&output.stdout)
+}
+
+fn ensure_terminal_agent_create_stdout(stdout: &str) -> Result<()> {
+    let value: Value =
+        serde_json::from_str(stdout).context("superset agents create did not return JSON")?;
+    let kind = value
+        .get("kind")
+        .and_then(Value::as_str)
+        .context("superset agents create output omitted kind")?;
+    if kind != "terminal" {
+        bail!(
+            "superset agents create returned a '{kind}' session; ssctl can only register terminal-backed sessions"
+        );
+    }
+    if value.get("sessionId").and_then(Value::as_str).is_none() {
+        bail!("superset agents create terminal output omitted sessionId");
     }
     Ok(())
 }
@@ -659,6 +874,13 @@ fn connect_terminal_host(config: &RuntimeConfig) -> Result<TerminalHostClient> {
         config.terminal_host_token.clone(),
     );
     TerminalHostClient::connect(&paths)
+}
+
+fn connect_superset_runtime(
+    config: &RuntimeConfig,
+    runtime: &SupersetHostRuntime,
+) -> Result<SupersetRuntimeClient> {
+    SupersetRuntimeClient::connect(&config.superset_home, runtime)
 }
 
 fn read_file_or_text(value: &str) -> Result<String> {
@@ -815,6 +1037,52 @@ fn print_status_human(report: &StatusReport) -> Result<()> {
         writeln!(stdout, "  error: {error}")?;
     }
 
+    writeln!(stdout)?;
+    writeln!(stdout, "PTY daemon")?;
+    if let Some(organization_id) = &report.pty_daemon.organization_id {
+        writeln!(stdout, "  organization: {organization_id}")?;
+    }
+    writeln!(
+        stdout,
+        "  manifest: {} ({})",
+        report.pty_daemon.manifest,
+        exists_label(report.pty_daemon.manifest_exists)
+    )?;
+    if let Some(socket) = &report.pty_daemon.socket {
+        writeln!(
+            stdout,
+            "  socket: {} ({})",
+            socket,
+            exists_label(report.pty_daemon.socket_exists)
+        )?;
+    }
+    if let Some(host_db) = &report.pty_daemon.host_db {
+        writeln!(
+            stdout,
+            "  host db: {} ({})",
+            host_db,
+            exists_label(report.pty_daemon.host_db_exists)
+        )?;
+    }
+    if let Some(hello) = &report.pty_daemon.hello {
+        writeln!(
+            stdout,
+            "  hello: ok protocol={} daemon={} pid={}",
+            hello.protocol,
+            hello.daemon_version,
+            hello
+                .daemon_pid
+                .map(|pid| pid.to_string())
+                .unwrap_or_else(|| "unknown".to_owned())
+        )?;
+    }
+    if let Some(count) = report.pty_daemon.session_count {
+        writeln!(stdout, "  sessions: {count}")?;
+    }
+    if let Some(error) = &report.pty_daemon.error {
+        writeln!(stdout, "  error: {error}")?;
+    }
+
     Ok(())
 }
 
@@ -845,7 +1113,7 @@ fn write_command_summary(
 
 fn print_sessions_human(sessions: &[TerminalSessionInfo]) {
     if sessions.is_empty() {
-        println!("No terminal-host sessions.");
+        println!("No pty-daemon sessions.");
         return;
     }
 
@@ -884,6 +1152,25 @@ fn print_send_human(output: &SendOutput) {
     }
     if let Some(path) = &output.pointer_path {
         println!("pointer: {}", display_path(path));
+    }
+}
+
+fn print_close_human(output: &CloseOutput) {
+    if output.dry_run {
+        println!(
+            "dry-run: would close session {} workspace {} signal {}",
+            output.session_id, output.workspace_id, output.signal
+        );
+    } else {
+        println!(
+            "closed: session {} workspace {} signal {}",
+            output.session_id, output.workspace_id, output.signal
+        );
+    }
+    if output.registry_updated
+        && let Some(role) = &output.role
+    {
+        println!("removed role: {role}");
     }
 }
 
@@ -927,8 +1214,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        SnapshotPolicy, load_spawn_registry, prepare_structured_message,
-        sanitize_filename_component,
+        SessionTarget, SessionTargetRequest, SnapshotPolicy, apply_close_registry_update,
+        ensure_force_unregistered_session_usage, load_spawn_registry, prepare_structured_message,
+        resolve_session_target, sanitize_filename_component,
     };
     use crate::registry::{Registry, RegistryEntry, RegistryStore};
     use crate::terminal_host::TerminalSessionInfo;
@@ -1027,6 +1315,149 @@ mod tests {
         assert!(!store.load().unwrap().roles.contains_key("worker"));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn force_unregistered_session_is_only_valid_with_session_target() {
+        let error = ensure_force_unregistered_session_usage(Some("worker"), true).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "--force-unregistered-session is only valid with --session"
+        );
+        assert!(ensure_force_unregistered_session_usage(None, true).is_ok());
+    }
+
+    #[test]
+    fn resolves_registered_role_target() {
+        let mut registry = Registry::default();
+        registry.roles.insert(
+            "worker".to_owned(),
+            RegistryEntry::new(
+                "codex".to_owned(),
+                "workspace-1".to_owned(),
+                "session-1".to_owned(),
+                "superset agents create".to_owned(),
+            ),
+        );
+
+        let target = resolve_session_target(
+            SessionTargetRequest {
+                role: Some("worker"),
+                session: None,
+                force_unregistered_session: false,
+                workspace: None,
+                dry_run: false,
+            },
+            &registry,
+            &[session("session-1", "workspace-1", true)],
+        )
+        .unwrap();
+
+        assert_eq!(target.role.as_deref(), Some("worker"));
+        assert_eq!(target.registered_role.as_deref(), Some("worker"));
+        assert_eq!(target.session_id, "session-1");
+        assert_eq!(target.workspace_id, "workspace-1");
+        assert!(target.registered);
+    }
+
+    #[test]
+    fn unregistered_session_requires_force_and_workspace() {
+        let registry = Registry::default();
+        let sessions = [session("session-1", "workspace-1", true)];
+
+        let error = resolve_session_target(
+            SessionTargetRequest {
+                role: None,
+                session: Some("session-1"),
+                force_unregistered_session: false,
+                workspace: None,
+                dry_run: false,
+            },
+            &registry,
+            &sessions,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("--force-unregistered-session"));
+
+        let error = resolve_session_target(
+            SessionTargetRequest {
+                role: None,
+                session: Some("session-1"),
+                force_unregistered_session: true,
+                workspace: None,
+                dry_run: false,
+            },
+            &registry,
+            &sessions,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "--workspace is required with --force-unregistered-session"
+        );
+    }
+
+    #[test]
+    fn close_registry_update_removes_registered_role() {
+        let mut registry = Registry::default();
+        registry.roles.insert(
+            "worker".to_owned(),
+            RegistryEntry::new(
+                "codex".to_owned(),
+                "workspace-1".to_owned(),
+                "session-1".to_owned(),
+                "superset agents create".to_owned(),
+            ),
+        );
+
+        let updated = apply_close_registry_update(
+            &mut registry,
+            &SessionTarget {
+                role: Some("worker".to_owned()),
+                registered_role: Some("worker".to_owned()),
+                session_id: "session-1".to_owned(),
+                workspace_id: "workspace-1".to_owned(),
+                registered: true,
+            },
+            false,
+        )
+        .unwrap();
+
+        assert!(updated);
+        assert!(!registry.roles.contains_key("worker"));
+    }
+
+    #[test]
+    fn dry_run_close_registry_update_does_not_mutate() {
+        let mut registry = Registry::default();
+        registry.roles.insert(
+            "worker".to_owned(),
+            RegistryEntry::new(
+                "codex".to_owned(),
+                "workspace-1".to_owned(),
+                "session-1".to_owned(),
+                "superset agents create".to_owned(),
+            ),
+        );
+
+        let updated = apply_close_registry_update(
+            &mut registry,
+            &SessionTarget {
+                role: Some("worker".to_owned()),
+                registered_role: Some("worker".to_owned()),
+                session_id: "session-1".to_owned(),
+                workspace_id: "workspace-1".to_owned(),
+                registered: true,
+            },
+            true,
+        )
+        .unwrap();
+
+        assert!(!updated);
+        assert!(registry.roles.contains_key("worker"));
     }
 
     #[test]
