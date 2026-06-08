@@ -8,8 +8,6 @@
 
 `ssctl`は、Codexなどの主処理からSupersetの端末に紐づくエージェントを補助エージェントのように扱う作業の流れを想定しています。公開されているSuperset操作はSupersetのコマンドラインツールに委譲し、既存セッションの確認と書き込みには実験的なSupersetのpty-daemon通信仕様v2とSupersetホストデータベースの付帯情報を使います。
 
-詳細な設計メモは[docs/local/architecture.md](docs/local/architecture.md)にあります。
-
 ## 要件
 
 | 要件 | 詳細 |

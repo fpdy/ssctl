@@ -15,9 +15,6 @@ Superset terminal-backed agents as subagents. Public Superset operations are
 delegated to the Superset CLI, while existing-session inspection and writes use
 the experimental Superset pty-daemon protocol v2 and Superset host DB metadata.
 
-Detailed design notes are available in
-[docs/local/architecture.md](docs/local/architecture.md).
-
 ## Requirements
 
 | Requirement | Details |
