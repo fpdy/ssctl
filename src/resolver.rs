@@ -26,19 +26,22 @@ pub fn resolve_spawned_session(
     workspace_id: &str,
     cli_stdout: &str,
 ) -> Result<SpawnResolution> {
-    let direct_matches = verified_cli_session_matches(
-        after,
-        workspace_id,
-        extract_session_id_candidates(cli_stdout),
-    );
-    if direct_matches.len() == 1 {
-        return Ok(SpawnResolution {
-            session: direct_matches[0].clone(),
-            strategy: SpawnResolutionStrategy::VerifiedCliSessionId,
-        });
-    }
-    if direct_matches.len() > 1 {
-        bail!("spawn output matched multiple terminal-host sessions; registry was not updated");
+    let candidates = extract_session_id_candidates(cli_stdout);
+    if !candidates.is_empty() {
+        let direct_matches = verified_cli_session_matches(after, workspace_id, &candidates);
+        if direct_matches.len() == 1 {
+            return Ok(SpawnResolution {
+                session: direct_matches[0].clone(),
+                strategy: SpawnResolutionStrategy::VerifiedCliSessionId,
+            });
+        }
+        if direct_matches.len() > 1 {
+            bail!("spawn output matched multiple pty-daemon sessions; registry was not updated");
+        }
+        bail!(
+            "spawn output session id was not found in pty-daemon workspace {}; registry was not updated",
+            workspace_id
+        );
     }
 
     let before_ids = before
@@ -60,7 +63,7 @@ pub fn resolve_spawned_session(
         });
     }
     if new_workspace_sessions.len() > 1 {
-        bail!("spawn created multiple candidate terminal-host sessions; registry was not updated");
+        bail!("spawn created multiple candidate pty-daemon sessions; registry was not updated");
     }
 
     bail!("could not uniquely correlate created Superset session; registry was not updated")
@@ -72,14 +75,14 @@ pub fn extract_session_id_candidates(stdout: &str) -> BTreeSet<String> {
     };
 
     let mut candidates = BTreeSet::new();
-    collect_candidate_values(&value, None, &mut candidates);
+    collect_candidate_values(&value, None, false, &mut candidates);
     candidates
 }
 
 fn verified_cli_session_matches(
     sessions: &[TerminalSessionInfo],
     workspace_id: &str,
-    candidates: BTreeSet<String>,
+    candidates: &BTreeSet<String>,
 ) -> Vec<TerminalSessionInfo> {
     if candidates.is_empty() {
         return Vec::new();
@@ -94,20 +97,34 @@ fn verified_cli_session_matches(
         .collect()
 }
 
-fn collect_candidate_values(value: &Value, key: Option<&str>, candidates: &mut BTreeSet<String>) {
+fn collect_candidate_values(
+    value: &Value,
+    key: Option<&str>,
+    session_context: bool,
+    candidates: &mut BTreeSet<String>,
+) {
     match value {
         Value::Object(map) => {
+            let child_session_context = session_context || key.is_some_and(is_session_context_key);
             for (child_key, child_value) in map {
-                collect_candidate_values(child_value, Some(child_key), candidates);
+                collect_candidate_values(
+                    child_value,
+                    Some(child_key),
+                    child_session_context,
+                    candidates,
+                );
             }
         }
         Value::Array(values) => {
             for child in values {
-                collect_candidate_values(child, key, candidates);
+                collect_candidate_values(child, key, session_context, candidates);
             }
         }
         Value::String(text) => {
-            if key.is_some_and(is_session_id_key) && looks_like_id(text) {
+            if key.is_some_and(|key| {
+                is_session_id_key(key) || is_session_context_id(key, session_context)
+            }) && looks_like_id(text)
+            {
                 candidates.insert(text.clone());
             }
         }
@@ -118,6 +135,14 @@ fn collect_candidate_values(value: &Value, key: Option<&str>, candidates: &mut B
 fn is_session_id_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
     lower.contains("session") && lower.ends_with("id")
+}
+
+fn is_session_context_key(key: &str) -> bool {
+    key.to_ascii_lowercase().contains("session")
+}
+
+fn is_session_context_id(key: &str, session_context: bool) -> bool {
+    session_context && key.eq_ignore_ascii_case("id")
 }
 
 fn looks_like_id(value: &str) -> bool {
@@ -141,6 +166,13 @@ mod tests {
         );
         assert!(candidates.contains("s-12345678"));
         assert!(!candidates.contains("ambiguous"));
+    }
+
+    #[test]
+    fn extracts_nested_session_id_fields() {
+        let candidates =
+            extract_session_id_candidates(r#"{"terminalSession":{"id":"s-12345678"}}"#);
+        assert!(candidates.contains("s-12345678"));
     }
 
     #[test]
@@ -191,6 +223,23 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn does_not_fallback_when_cli_session_id_is_unverified() {
+        let before = session("old", "w-1");
+        let after = session("new", "w-1");
+        let result = resolve_spawned_session(
+            std::slice::from_ref(&before),
+            &[before.clone(), after],
+            "w-1",
+            r#"{"sessionId":"missing-session"}"#,
+        );
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "spawn output session id was not found in pty-daemon workspace w-1; registry was not updated"
+        );
     }
 
     fn session(session_id: &str, workspace_id: &str) -> TerminalSessionInfo {

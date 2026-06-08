@@ -81,8 +81,9 @@ ssctl close --session <session-id> --force-unregistered-session --workspace <wor
 
 | パス | 用途 |
 | --- | --- |
-| `.ssctl/registry.json` | ローカルの役割からセッションへの対応を保存します。 |
-| `.ssctl/` | ロックファイルなど登録情報に関わるファイルを保持します。 |
+| `.ssctl/registry.json` | active な role と session の対応、および進行中の `pendingSpawns` を保存します。 |
+| `.ssctl/registry.lock` | registry の読み書きだけを保護する短命のロックです。 |
+| `.ssctl/` | `ssctl` のローカル実行状態を保持します。 |
 | `.agent-results/` | `ssctl report`が作成した報告の写しを保存します。 |
 | `~/.superset/host/<organization-id>/pty-daemon-manifest.json` | pty-daemonソケットと対応する通信仕様の版を記録します。 |
 | `~/.superset/host/<organization-id>/host.db` | ptyセッションにワークスペースとライフサイクルの付帯情報を付与するためのSupersetホストデータベースです。 |

@@ -15,8 +15,9 @@ use crate::cli::{
 };
 use crate::config::RuntimeConfig;
 use crate::registry::{
-    ForceSendAuditEntry, Registry, RegistryEntry, RegistryStore, cleanup_stale_sessions,
-    role_for_session, sha256_hex, timestamp_for_filename,
+    ForceSendAuditEntry, PendingSpawnEntry, Registry, RegistryEntry, RegistryStore,
+    cleanup_stale_pending_spawns, cleanup_stale_sessions, role_for_session, sha256_hex,
+    spawn_request_id, timestamp_for_filename,
 };
 use crate::resolver::{SpawnResolution, resolve_spawned_session};
 use crate::superset_cli::{CommandOutput, SupersetCliAdapter};
@@ -92,40 +93,49 @@ fn sessions(config: &RuntimeConfig, args: OutputArgs) -> Result<()> {
 
 fn spawn(config: &RuntimeConfig, args: SpawnArgs) -> Result<()> {
     let store = RegistryStore::new(config.registry_dir.clone());
-    let _lock = store.acquire_lock()?;
+    let prompt = read_file_or_text(&args.prompt)?;
     let adapter = SupersetCliAdapter::new(config.superset_bin.clone());
     let runtime = ensure_superset_host_running(&adapter)?;
 
     let mut client = connect_superset_runtime(config, &runtime)?;
     let before = client.list_sessions()?;
-    let mut registry = load_spawn_registry(&store, &args.role, &before)?;
-    let prompt = read_file_or_text(&args.prompt)?;
-    let output = adapter.agents_create(&args.workspace, &args.agent, &prompt)?;
-    ensure_command_success(&output, "superset agents create")?;
-    ensure_terminal_agent_create_stdout(&output.stdout)?;
+    let reservation =
+        reserve_pending_spawn(&store, &args.role, &args.agent, &args.workspace, &before)?;
 
-    let (after, resolution) =
-        poll_spawn_resolution(&mut client, &before, &args.workspace, &output.stdout)?;
+    let spawn_result = (|| -> Result<SpawnOutput> {
+        let output = adapter.agents_create(&args.workspace, &args.agent, &prompt)?;
+        ensure_command_success(&output, "superset agents create")?;
+        ensure_terminal_agent_create_stdout(&output.stdout)?;
 
-    cleanup_stale_sessions(&mut registry, &after);
-    registry.roles.insert(
-        args.role.clone(),
-        RegistryEntry::new(
-            args.agent.clone(),
-            args.workspace.clone(),
-            resolution.session.session_id.clone(),
-            "superset agents create".to_owned(),
-        ),
-    );
-    store.save(&registry)?;
+        let (after, resolution) =
+            poll_spawn_resolution(&mut client, &before, &args.workspace, &output.stdout)?;
 
-    let spawn_output = SpawnOutput {
-        role: args.role,
-        agent: args.agent,
-        workspace_id: args.workspace,
-        session_id: resolution.session.session_id,
-        strategy: resolution.strategy,
-        registry: store.registry_path().to_path_buf(),
+        complete_pending_spawn(
+            &store,
+            &reservation,
+            &args.agent,
+            &args.workspace,
+            &resolution.session.session_id,
+            &after,
+        )?;
+
+        Ok(SpawnOutput {
+            role: args.role.clone(),
+            agent: args.agent.clone(),
+            workspace_id: args.workspace.clone(),
+            session_id: resolution.session.session_id,
+            strategy: resolution.strategy,
+            request_id: reservation.request_id.clone(),
+            registry: store.registry_path().to_path_buf(),
+        })
+    })();
+
+    let spawn_output = match spawn_result {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = cancel_pending_spawn(&store, &reservation);
+            return Err(error);
+        }
     };
 
     if args.json {
@@ -140,20 +150,105 @@ fn spawn(config: &RuntimeConfig, args: SpawnArgs) -> Result<()> {
     Ok(())
 }
 
-fn load_spawn_registry(
+fn reserve_pending_spawn(
     store: &RegistryStore,
     role: &str,
+    agent: &str,
+    workspace_id: &str,
     sessions: &[TerminalSessionInfo],
-) -> Result<Registry> {
+) -> Result<SpawnReservation> {
+    let _lock = store.acquire_lock()?;
     let mut registry = store.load()?;
-    let cleanup = cleanup_stale_sessions(&mut registry, sessions);
+    cleanup_stale_sessions(&mut registry, sessions);
+    cleanup_stale_pending_spawns(&mut registry);
     if registry.roles.contains_key(role) {
         bail!("role '{}' is already registered", role);
     }
-    if cleanup.removed_roles > 0 {
+    if let Some(pending) = registry.pending_spawns.get(role) {
+        bail!(
+            "role '{}' is already spawning; request {} pid {} started at {}",
+            role,
+            pending.request_id,
+            pending.pid,
+            pending.started_at
+        );
+    }
+
+    let request_id = spawn_request_id(role, agent, workspace_id);
+    registry.pending_spawns.insert(
+        role.to_owned(),
+        PendingSpawnEntry::new(
+            agent.to_owned(),
+            workspace_id.to_owned(),
+            request_id.clone(),
+            "superset agents create".to_owned(),
+        ),
+    );
+    store.save(&registry)?;
+
+    Ok(SpawnReservation {
+        role: role.to_owned(),
+        request_id,
+    })
+}
+
+fn complete_pending_spawn(
+    store: &RegistryStore,
+    reservation: &SpawnReservation,
+    agent: &str,
+    workspace_id: &str,
+    session_id: &str,
+    sessions: &[TerminalSessionInfo],
+) -> Result<()> {
+    let _lock = store.acquire_lock()?;
+    let mut registry = store.load()?;
+    cleanup_stale_sessions(&mut registry, sessions);
+    cleanup_stale_pending_spawns(&mut registry);
+
+    let pending = registry
+        .pending_spawns
+        .get(&reservation.role)
+        .with_context(|| format!("pending spawn for role '{}' disappeared", reservation.role))?;
+    if pending.request_id != reservation.request_id {
+        bail!(
+            "pending spawn for role '{}' was replaced; registry was not updated",
+            reservation.role
+        );
+    }
+    if registry.roles.contains_key(&reservation.role) {
+        bail!(
+            "role '{}' became registered while spawn was pending; registry was not updated",
+            reservation.role
+        );
+    }
+
+    registry.pending_spawns.remove(&reservation.role);
+    registry.roles.insert(
+        reservation.role.clone(),
+        RegistryEntry::new(
+            agent.to_owned(),
+            workspace_id.to_owned(),
+            session_id.to_owned(),
+            "superset agents create".to_owned(),
+        ),
+    );
+    store.save(&registry)
+}
+
+fn cancel_pending_spawn(store: &RegistryStore, reservation: &SpawnReservation) -> Result<bool> {
+    let _lock = store.acquire_lock()?;
+    let mut registry = store.load()?;
+    let remove = registry
+        .pending_spawns
+        .get(&reservation.role)
+        .is_some_and(|pending| pending.request_id == reservation.request_id);
+
+    if remove {
+        registry.pending_spawns.remove(&reservation.role);
         store.save(&registry)?;
     }
-    Ok(registry)
+
+    Ok(remove)
 }
 
 fn send(config: &RuntimeConfig, args: SendArgs) -> Result<()> {
@@ -324,6 +419,7 @@ struct SpawnOutput {
     workspace_id: String,
     session_id: String,
     strategy: crate::resolver::SpawnResolutionStrategy,
+    request_id: String,
     registry: PathBuf,
 }
 
@@ -333,6 +429,12 @@ struct PreparedMessage {
     body_hash: String,
     body_bytes: usize,
     pointer_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct SpawnReservation {
+    role: String,
+    request_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -525,15 +627,24 @@ fn send_prepared(
     request: SessionTargetRequest<'_>,
     prepared: PreparedMessage,
 ) -> Result<SendOutput> {
-    let _lock = store.acquire_lock()?;
     let adapter = SupersetCliAdapter::new(config.superset_bin.clone());
     let runtime = ensure_superset_host_running(&adapter)?;
 
     let mut client = connect_superset_runtime(config, &runtime)?;
     let sessions = client.list_sessions()?;
-    let mut registry = store.load()?;
-    let cleanup = cleanup_stale_sessions(&mut registry, &sessions);
-    let target = resolve_session_target(request, &registry, &sessions)?;
+    let target = {
+        let _lock = store.acquire_lock()?;
+        let mut registry = store.load()?;
+        let session_cleanup = cleanup_stale_sessions(&mut registry, &sessions);
+        let pending_cleanup = cleanup_stale_pending_spawns(&mut registry);
+        let target = resolve_session_target(request, &registry, &sessions)?;
+        if !request.dry_run
+            && (session_cleanup.removed_roles > 0 || pending_cleanup.removed_pending_spawns > 0)
+        {
+            store.save(&registry)?;
+        }
+        target
+    };
 
     let output = SendOutput {
         role: target.role.clone(),
@@ -555,19 +666,8 @@ fn send_prepared(
     client.write(&target.session_id, &prepared.data)?;
 
     if let Some(role) = &target.registered_role {
-        let entry = registry
-            .roles
-            .get_mut(role)
-            .context("registered send target disappeared")?;
-        entry.touch_verified();
-    }
-
-    if target.registered {
-        store.save(&registry)?;
+        touch_registered_role(store, role, &target.session_id)?;
     } else {
-        if cleanup.removed_roles > 0 {
-            store.save(&registry)?;
-        }
         store.append_force_send_audit(&ForceSendAuditEntry::new(
             target.role.clone(),
             target.session_id.clone(),
@@ -586,18 +686,26 @@ fn close_session(
     request: SessionTargetRequest<'_>,
     signal: &str,
 ) -> Result<CloseOutput> {
-    let _lock = store.acquire_lock()?;
     let adapter = SupersetCliAdapter::new(config.superset_bin.clone());
     let runtime = ensure_superset_host_running(&adapter)?;
 
     let mut client = connect_superset_runtime(config, &runtime)?;
     let sessions = client.list_sessions()?;
-    let mut registry = store.load()?;
-    let cleanup = cleanup_stale_sessions(&mut registry, &sessions);
-    let target = resolve_session_target(request, &registry, &sessions)?;
-    let registry_updated = apply_close_registry_update(&mut registry, &target, request.dry_run)?;
+    let target = {
+        let _lock = store.acquire_lock()?;
+        let mut registry = store.load()?;
+        let session_cleanup = cleanup_stale_sessions(&mut registry, &sessions);
+        let pending_cleanup = cleanup_stale_pending_spawns(&mut registry);
+        let target = resolve_session_target(request, &registry, &sessions)?;
+        if !request.dry_run
+            && (session_cleanup.removed_roles > 0 || pending_cleanup.removed_pending_spawns > 0)
+        {
+            store.save(&registry)?;
+        }
+        target
+    };
 
-    let output = CloseOutput {
+    let mut output = CloseOutput {
         role: target.role.clone(),
         session_id: target.session_id.clone(),
         workspace_id: target.workspace_id.clone(),
@@ -605,7 +713,7 @@ fn close_session(
         dry_run: request.dry_run,
         closed: !request.dry_run,
         signal: signal.to_owned(),
-        registry_updated,
+        registry_updated: false,
     };
 
     if request.dry_run {
@@ -614,11 +722,45 @@ fn close_session(
 
     client.close(&target.session_id, signal)?;
 
-    if registry_updated || cleanup.removed_roles > 0 {
-        store.save(&registry)?;
-    }
+    output.registry_updated = remove_registered_role_after_close(store, &target)?;
 
     Ok(output)
+}
+
+fn touch_registered_role(store: &RegistryStore, role: &str, session_id: &str) -> Result<bool> {
+    let _lock = store.acquire_lock()?;
+    let mut registry = store.load()?;
+    let Some(entry) = registry.roles.get_mut(role) else {
+        return Ok(false);
+    };
+    if entry.session_id != session_id {
+        return Ok(false);
+    }
+    entry.touch_verified();
+    store.save(&registry)?;
+    Ok(true)
+}
+
+fn remove_registered_role_after_close(
+    store: &RegistryStore,
+    target: &SessionTarget,
+) -> Result<bool> {
+    let Some(role) = &target.registered_role else {
+        return Ok(false);
+    };
+
+    let _lock = store.acquire_lock()?;
+    let mut registry = store.load()?;
+    let Some(entry) = registry.roles.get(role) else {
+        return Ok(false);
+    };
+    if entry.session_id != target.session_id {
+        return Ok(false);
+    }
+
+    registry.roles.remove(role);
+    store.save(&registry)?;
+    Ok(true)
 }
 
 fn resolve_session_target(
@@ -691,6 +833,7 @@ fn ensure_force_unregistered_session_usage(role: Option<&str>, force: bool) -> R
     Ok(())
 }
 
+#[cfg(test)]
 fn apply_close_registry_update(
     registry: &mut Registry,
     target: &SessionTarget,
@@ -1215,10 +1358,11 @@ mod tests {
 
     use super::{
         SessionTarget, SessionTargetRequest, SnapshotPolicy, apply_close_registry_update,
-        ensure_force_unregistered_session_usage, load_spawn_registry, prepare_structured_message,
-        resolve_session_target, sanitize_filename_component,
+        cancel_pending_spawn, complete_pending_spawn, ensure_force_unregistered_session_usage,
+        prepare_structured_message, reserve_pending_spawn, resolve_session_target,
+        sanitize_filename_component,
     };
-    use crate::registry::{Registry, RegistryEntry, RegistryStore};
+    use crate::registry::{PendingSpawnEntry, Registry, RegistryEntry, RegistryStore};
     use crate::terminal_host::TerminalSessionInfo;
 
     #[test]
@@ -1264,7 +1408,7 @@ mod tests {
     }
 
     #[test]
-    fn spawn_registry_rejects_active_existing_role_before_create() {
+    fn spawn_reservation_rejects_active_existing_role_before_create() {
         let root = test_root("spawn-active-role");
         let _ = fs::remove_dir_all(&root);
         let store = RegistryStore::new(&root);
@@ -1280,9 +1424,11 @@ mod tests {
         );
         store.save(&registry).unwrap();
 
-        let error = load_spawn_registry(
+        let error = reserve_pending_spawn(
             &store,
             "worker",
+            "codex",
+            "workspace-1",
             &[session("session-1", "workspace-1", true)],
         )
         .unwrap_err();
@@ -1293,7 +1439,7 @@ mod tests {
     }
 
     #[test]
-    fn spawn_registry_cleans_stale_role_before_duplicate_check() {
+    fn spawn_reservation_cleans_stale_role_before_duplicate_check() {
         let root = test_root("spawn-stale-role");
         let _ = fs::remove_dir_all(&root);
         let store = RegistryStore::new(&root);
@@ -1309,10 +1455,88 @@ mod tests {
         );
         store.save(&registry).unwrap();
 
-        let loaded = load_spawn_registry(&store, "worker", &[]).unwrap();
+        let reservation =
+            reserve_pending_spawn(&store, "worker", "codex", "workspace-1", &[]).unwrap();
+        let loaded = store.load().unwrap();
 
         assert!(!loaded.roles.contains_key("worker"));
+        assert!(loaded.pending_spawns.contains_key("worker"));
         assert!(!store.load().unwrap().roles.contains_key("worker"));
+        cancel_pending_spawn(&store, &reservation).unwrap();
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn spawn_reservation_rejects_existing_pending_role() {
+        let root = test_root("spawn-pending-role");
+        let _ = fs::remove_dir_all(&root);
+        let store = RegistryStore::new(&root);
+        let first = reserve_pending_spawn(&store, "worker", "codex", "workspace-1", &[]).unwrap();
+
+        let error =
+            reserve_pending_spawn(&store, "worker", "codex", "workspace-1", &[]).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("role 'worker' is already spawning")
+        );
+        cancel_pending_spawn(&store, &first).unwrap();
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn spawn_reservation_cleans_stale_pending_role() {
+        let root = test_root("spawn-stale-pending-role");
+        let _ = fs::remove_dir_all(&root);
+        let store = RegistryStore::new(&root);
+        let mut registry = Registry::default();
+        let mut pending = PendingSpawnEntry::new(
+            "codex".to_owned(),
+            "workspace-1".to_owned(),
+            "stale-request".to_owned(),
+            "superset agents create".to_owned(),
+        );
+        pending.pid = u32::MAX;
+        registry.pending_spawns.insert("worker".to_owned(), pending);
+        store.save(&registry).unwrap();
+
+        let reservation =
+            reserve_pending_spawn(&store, "worker", "codex", "workspace-1", &[]).unwrap();
+        let loaded = store.load().unwrap();
+
+        assert_eq!(
+            loaded.pending_spawns["worker"].request_id,
+            reservation.request_id
+        );
+        cancel_pending_spawn(&store, &reservation).unwrap();
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn completing_spawn_promotes_matching_pending_entry() {
+        let root = test_root("spawn-complete");
+        let _ = fs::remove_dir_all(&root);
+        let store = RegistryStore::new(&root);
+        let reservation =
+            reserve_pending_spawn(&store, "worker", "codex", "workspace-1", &[]).unwrap();
+
+        complete_pending_spawn(
+            &store,
+            &reservation,
+            "codex",
+            "workspace-1",
+            "session-1",
+            &[session("session-1", "workspace-1", true)],
+        )
+        .unwrap();
+
+        let loaded = store.load().unwrap();
+        assert!(!loaded.pending_spawns.contains_key("worker"));
+        assert_eq!(loaded.roles["worker"].session_id, "session-1");
 
         let _ = fs::remove_dir_all(&root);
     }

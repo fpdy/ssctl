@@ -3,12 +3,12 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process;
+use std::process::{self, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -19,6 +19,7 @@ pub const REGISTRY_SCHEMA_VERSION: u64 = 1;
 
 const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+const PENDING_SPAWN_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, Clone)]
 pub struct RegistryStore {
@@ -39,6 +40,8 @@ pub struct RegistryLock {
 pub struct Registry {
     pub schema_version: u64,
     pub roles: BTreeMap<String, RegistryEntry>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pending_spawns: BTreeMap<String, PendingSpawnEntry>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -50,6 +53,18 @@ pub struct RegistryEntry {
     pub created_at: String,
     pub last_verified_at: String,
     pub terminal_host_protocol_version: u64,
+    pub source: String,
+    pub owner: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingSpawnEntry {
+    pub agent: String,
+    pub workspace_id: String,
+    pub request_id: String,
+    pub pid: u32,
+    pub started_at: String,
     pub source: String,
     pub owner: String,
 }
@@ -69,6 +84,7 @@ pub struct ForceSendAuditEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CleanupSummary {
     pub removed_roles: usize,
+    pub removed_pending_spawns: usize,
 }
 
 impl Default for Registry {
@@ -76,6 +92,7 @@ impl Default for Registry {
         Self {
             schema_version: REGISTRY_SCHEMA_VERSION,
             roles: BTreeMap::new(),
+            pending_spawns: BTreeMap::new(),
         }
     }
 }
@@ -106,35 +123,11 @@ impl RegistryStore {
 
     pub fn acquire_lock(&self) -> Result<RegistryLock> {
         ensure_private_dir(&self.root)?;
-        let start = Instant::now();
-
-        loop {
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&self.lock_path)
-            {
-                Ok(mut file) => {
-                    writeln!(file, "pid={}", process::id())?;
-                    file.sync_all()?;
-                    return Ok(RegistryLock {
-                        path: self.lock_path.clone(),
-                    });
-                }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    if start.elapsed() >= LOCK_WAIT_TIMEOUT {
-                        bail!(
-                            "timed out waiting for registry lock; remove stale .ssctl/registry.lock if no ssctl process is running"
-                        );
-                    }
-                    thread::sleep(LOCK_RETRY_INTERVAL);
-                }
-                Err(error) => {
-                    return Err(error).context("failed to create registry lock");
-                }
-            }
-        }
+        acquire_lock_file(
+            self.lock_path.clone(),
+            "registry lock",
+            "remove stale .ssctl/registry.lock if no ssctl process is running".to_owned(),
+        )
     }
 
     pub fn load(&self) -> Result<Registry> {
@@ -154,7 +147,37 @@ impl RegistryStore {
             Err(error) => Err(error).context("failed to read registry"),
         }
     }
+}
 
+fn acquire_lock_file(path: PathBuf, label: &str, stale_hint: String) -> Result<RegistryLock> {
+    let start = Instant::now();
+
+    loop {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                writeln!(file, "pid={}", process::id())?;
+                file.sync_all()?;
+                return Ok(RegistryLock { path });
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if start.elapsed() >= LOCK_WAIT_TIMEOUT {
+                    bail!("timed out waiting for {label}; {stale_hint}");
+                }
+                thread::sleep(LOCK_RETRY_INTERVAL);
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to create {label}"));
+            }
+        }
+    }
+}
+
+impl RegistryStore {
     pub fn save(&self, registry: &Registry) -> Result<()> {
         if registry.schema_version != REGISTRY_SCHEMA_VERSION {
             bail!(
@@ -243,6 +266,27 @@ impl RegistryEntry {
     }
 }
 
+impl PendingSpawnEntry {
+    pub fn new(agent: String, workspace_id: String, request_id: String, source: String) -> Self {
+        Self {
+            agent,
+            workspace_id,
+            request_id,
+            pid: process::id(),
+            started_at: timestamp_now(),
+            source,
+            owner: "ssctl".to_owned(),
+        }
+    }
+
+    pub fn is_stale(&self) -> bool {
+        if pending_spawn_age(&self.started_at).is_some_and(|age| age >= PENDING_SPAWN_MAX_AGE) {
+            return true;
+        }
+        !process_is_running(self.pid)
+    }
+}
+
 impl ForceSendAuditEntry {
     pub fn new(
         role: Option<String>,
@@ -293,6 +337,18 @@ pub fn cleanup_stale_sessions(
     });
     CleanupSummary {
         removed_roles: before.saturating_sub(registry.roles.len()),
+        removed_pending_spawns: 0,
+    }
+}
+
+pub fn cleanup_stale_pending_spawns(registry: &mut Registry) -> CleanupSummary {
+    let before = registry.pending_spawns.len();
+    registry
+        .pending_spawns
+        .retain(|_, pending| !pending.is_stale());
+    CleanupSummary {
+        removed_roles: 0,
+        removed_pending_spawns: before.saturating_sub(registry.pending_spawns.len()),
     }
 }
 
@@ -321,6 +377,35 @@ pub fn timestamp_for_filename() -> String {
     Utc::now().format("%Y%m%d-%H%M%S%.3fZ").to_string()
 }
 
+pub fn spawn_request_id(role: &str, agent: &str, workspace_id: &str) -> String {
+    let material = format!(
+        "{}\0{}\0{}\0{}\0{}",
+        role,
+        agent,
+        workspace_id,
+        process::id(),
+        timestamp_now()
+    );
+    sha256_hex(material.as_bytes())
+}
+
+fn pending_spawn_age(started_at: &str) -> Option<Duration> {
+    let started_at = DateTime::parse_from_rfc3339(started_at)
+        .ok()?
+        .with_timezone(&Utc);
+    Utc::now().signed_duration_since(started_at).to_std().ok()
+}
+
+fn process_is_running(pid: u32) -> bool {
+    Command::new("/bin/kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 fn ensure_private_dir(path: &Path) -> Result<()> {
     fs::create_dir_all(path).with_context(|| format!("failed to create {}", path.display()))?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
@@ -340,7 +425,8 @@ mod tests {
     use std::fs;
 
     use super::{
-        ForceSendAuditEntry, Registry, RegistryEntry, RegistryStore, cleanup_stale_sessions,
+        ForceSendAuditEntry, PendingSpawnEntry, Registry, RegistryEntry, RegistryStore,
+        cleanup_stale_pending_spawns, cleanup_stale_sessions,
     };
     use crate::terminal_host::TerminalSessionInfo;
 
@@ -419,5 +505,48 @@ mod tests {
 
         drop(_lock);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn store_round_trips_pending_spawns() {
+        let root =
+            std::env::temp_dir().join(format!("ssctl-pending-spawn-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let store = RegistryStore::new(&root);
+
+        let mut registry = Registry::default();
+        registry.pending_spawns.insert(
+            "worker".to_owned(),
+            PendingSpawnEntry::new(
+                "codex".to_owned(),
+                "workspace-1".to_owned(),
+                "request-1".to_owned(),
+                "superset agents create".to_owned(),
+            ),
+        );
+        store.save(&registry).unwrap();
+
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.pending_spawns["worker"].request_id, "request-1");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cleanup_removes_stale_pending_spawns() {
+        let mut registry = Registry::default();
+        let mut pending = PendingSpawnEntry::new(
+            "codex".to_owned(),
+            "workspace-1".to_owned(),
+            "request-1".to_owned(),
+            "superset agents create".to_owned(),
+        );
+        pending.pid = u32::MAX;
+        registry.pending_spawns.insert("worker".to_owned(), pending);
+
+        let summary = cleanup_stale_pending_spawns(&mut registry);
+
+        assert_eq!(summary.removed_pending_spawns, 1);
+        assert!(registry.pending_spawns.is_empty());
     }
 }

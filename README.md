@@ -91,8 +91,9 @@ local registry only after the pty-daemon confirms the close.
 
 | Path | Purpose |
 | --- | --- |
-| `.ssctl/registry.json` | Stores local role-to-session mappings. |
-| `.ssctl/` | Holds registry-related files, including the lock file. |
+| `.ssctl/registry.json` | Stores active role-to-session mappings and in-flight `pendingSpawns`. |
+| `.ssctl/registry.lock` | Short-lived lock for registry reads and writes. |
+| `.ssctl/` | Holds local runtime state for `ssctl`. |
 | `.agent-results/` | Stores report copies created by `ssctl report`. |
 | `~/.superset/host/<organization-id>/pty-daemon-manifest.json` | Describes the pty-daemon socket and supported protocol versions. |
 | `~/.superset/host/<organization-id>/host.db` | Superset host DB used to attach workspace and lifecycle metadata to pty sessions. |

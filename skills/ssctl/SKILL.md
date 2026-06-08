@@ -238,15 +238,15 @@ Use forced unregistered operations only after confirming the session is alive an
 
 Know these paths:
 
-- `.ssctl/registry.json`: local role-to-session registry.
-- `.ssctl/registry.lock`: transient lock for `spawn`, `send`, `close`, and registry updates.
+- `.ssctl/registry.json`: local active role-to-session registry plus in-flight `pendingSpawns`.
+- `.ssctl/registry.lock`: transient lock for registry reads and writes.
 - `.ssctl/messages/`: snapshots for oversized generated messages.
 - `.ssctl/audit.log`: audit records for forced unregistered sends.
 - `.agent-results/`: report copies created by `ssctl report`.
 
 These are local runtime artifacts. Do not commit them.
 
-If a registry lock times out, remove `.ssctl/registry.lock` only after confirming no `ssctl` process is still running.
+If a registry lock times out, remove `.ssctl/registry.lock` only after confirming no `ssctl` process is still running. Do not manually edit `pendingSpawns`; stale pending entries are reclaimed automatically when the recorded process is gone or the entry exceeds the stale-age window.
 
 ## Troubleshooting
 
