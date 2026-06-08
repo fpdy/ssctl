@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.1] - 2026-06-08
+
+### Added
+
+- Added the `ssctl` Agent Skill under `skills/ssctl/` so it can be installed
+  from this public repository with `npx skills`.
+
+### Changed
+
+- Refined README content and removed links to local-only architecture notes.
+
 ## [0.2.0] - 2026-06-08
 
 ### Added
@@ -31,5 +42,6 @@ All notable changes to this project will be documented in this file.
 - Structured message transport with bracketed paste wrapping and oversized payload pointerization.
 - Superset public CLI adapter and terminal-host protocol v2 client for session inspection and writes.
 
+[0.2.1]: https://github.com/fpdy/ssctl/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/fpdy/ssctl/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/fpdy/ssctl/releases/tag/v0.1.0
