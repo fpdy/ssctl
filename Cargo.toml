@@ -2,8 +2,11 @@
 name = "ssctl"
 version = "0.1.0"
 edition = "2024"
-description = "Superset agent/session orchestration helper"
-publish = false
+description = "Rust CLI for orchestrating Superset terminal-backed agent sessions"
+license = "MIT"
+repository = "https://github.com/fpdy/ssctl"
+keywords = ["superset", "agents", "terminal", "cli"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1"
