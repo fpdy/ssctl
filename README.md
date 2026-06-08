@@ -118,9 +118,3 @@ cleanup, and audit logging for forced unregistered sends.
   message to the target role.
 - `close --dry-run` resolves and validates the target without sending a close
   request or changing the registry.
-
-## Architecture
-
-The local design is documented in
-[docs/local/architecture.md](docs/local/architecture.md). Release notes are
-tracked in [CHANGELOG.md](CHANGELOG.md).

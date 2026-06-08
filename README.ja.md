@@ -101,7 +101,3 @@ ssctl close --session <session-id> --force-unregistered-session --workspace <wor
 - 大きすぎるメッセージは、端末へ直接貼り付けず参照メッセージに変換します。
 - `report`は報告の写しを`.agent-results/`に保存し、対象の役割には参照メッセージだけを送ります。
 - `close --dry-run`は対象を解決・検証しますが、終了要求の送信や登録情報の変更は行いません。
-
-## アーキテクチャ
-
-ローカル設計は[docs/local/architecture.md](docs/local/architecture.md)に記載されています。リリースノートは[CHANGELOG.md](CHANGELOG.md)で管理しています。
