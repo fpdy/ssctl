@@ -1,0 +1,15 @@
+# local documents
+/docs/local
+
+# agents
+/.agents/
+/.codex/
+/opencode.jsonc
+/AGENTS.md
+/CLAUDE.md
+/.ignore
+
+# app
+/target/
+/.ssctl/
+/.agent-results/
