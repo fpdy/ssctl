@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.3] - 2026-06-10
+
+### Fixed
+
+- Changed `ssctl close` to use Superset host-service `terminal.killSession`
+  for the default close path so terminal sessions are disposed in the App, not
+  only killed in the pty-daemon.
+- Explicit close signals still use the pty-daemon signal first, then call the
+  host-service lifecycle to dispose the App-side terminal state.
+- Registered roles are removed from `.ssctl/registry.json` only after the close
+  lifecycle succeeds.
+
+### Security
+
+- Hardened host-service manifest endpoint validation so host-service
+  `authToken` values are sent only to loopback HTTP endpoints without URL
+  credentials.
+
 ## [0.2.2] - 2026-06-09
 
 ### Fixed
@@ -46,15 +64,8 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
-- Changed `ssctl close` to use Superset host-service `terminal.killSession`
-  for the default close path so terminal sessions are disposed in the App, not
-  only killed in the pty-daemon.
-- Explicit close signals still use the pty-daemon signal first, then call the
-  host-service lifecycle to dispose the App-side terminal state.
 - Moved existing-session inspection, sends, spawn verification, and close support
   onto the Superset pty-daemon runtime path.
-- Registered roles are removed from `.ssctl/registry.json` only after the close
-  lifecycle succeeds.
 
 ## [0.1.0] - 2026-06-08
 
@@ -66,6 +77,7 @@ All notable changes to this project will be documented in this file.
 - Structured message transport with bracketed paste wrapping and oversized payload pointerization.
 - Superset public CLI adapter and terminal-host protocol v2 client for session inspection and writes.
 
+[0.2.3]: https://github.com/fpdy/ssctl/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/fpdy/ssctl/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/fpdy/ssctl/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/fpdy/ssctl/compare/v0.1.0...v0.2.0

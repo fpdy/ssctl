@@ -1,6 +1,6 @@
 [package]
 name = "ssctl"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 description = "Rust CLI for orchestrating Superset terminal-backed agent sessions"
 license = "MIT"
