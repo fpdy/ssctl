@@ -6,6 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use url::{Host, Url};
 
 use crate::superset_runtime::SupersetHostRuntime;
 
@@ -51,7 +52,7 @@ pub fn load_host_service_manifest(
     let path = host_service_manifest_path(superset_home, organization_id);
     let contents =
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    let manifest: HostServiceManifest =
+    let mut manifest: HostServiceManifest =
         serde_json::from_str(&contents).context("failed to parse host-service manifest")?;
     if manifest.organization_id != organization_id {
         bail!(
@@ -63,6 +64,7 @@ pub fn load_host_service_manifest(
     if manifest.endpoint.trim().is_empty() {
         bail!("host-service manifest omitted endpoint");
     }
+    manifest.endpoint = validate_host_service_endpoint(&manifest.endpoint)?;
     if manifest.auth_token.is_empty() {
         bail!("host-service manifest omitted authToken");
     }
@@ -120,6 +122,32 @@ fn trpc_procedure_url(endpoint: &str, procedure: &str) -> String {
     format!("{}/trpc/{}", endpoint.trim_end_matches('/'), procedure)
 }
 
+fn validate_host_service_endpoint(endpoint: &str) -> Result<String> {
+    let trimmed = endpoint.trim();
+    let url = Url::parse(trimmed).context("failed to parse host-service manifest endpoint")?;
+    if url.scheme() != "http" {
+        bail!("host-service manifest endpoint must use http");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("host-service manifest endpoint must not include credentials");
+    }
+    let Some(host) = url.host() else {
+        bail!("host-service manifest endpoint omitted host");
+    };
+    if !is_loopback_host(host) {
+        bail!("host-service manifest endpoint must be a loopback address");
+    }
+    Ok(trimmed.trim_end_matches('/').to_owned())
+}
+
+fn is_loopback_host(host: Host<&str>) -> bool {
+    match host {
+        Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
+        Host::Ipv4(address) => address.is_loopback(),
+        Host::Ipv6(address) => address.is_loopback(),
+    }
+}
+
 fn kill_session_payload(session_id: &str, workspace_id: &str) -> Value {
     json!({
         "json": {
@@ -154,7 +182,7 @@ mod tests {
 
     use super::{
         host_service_manifest_path, kill_session_payload, load_host_service_manifest,
-        trpc_procedure_url,
+        trpc_procedure_url, validate_host_service_endpoint,
     };
 
     #[test]
@@ -223,6 +251,36 @@ mod tests {
             trpc_procedure_url("http://127.0.0.1:48937/", "terminal.killSession"),
             "http://127.0.0.1:48937/trpc/terminal.killSession"
         );
+    }
+
+    #[test]
+    fn validates_loopback_host_service_endpoints() {
+        assert_eq!(
+            validate_host_service_endpoint("http://127.0.0.1:48937/").unwrap(),
+            "http://127.0.0.1:48937"
+        );
+        assert_eq!(
+            validate_host_service_endpoint("http://localhost:48937").unwrap(),
+            "http://localhost:48937"
+        );
+        assert_eq!(
+            validate_host_service_endpoint("http://[::1]:48937").unwrap(),
+            "http://[::1]:48937"
+        );
+    }
+
+    #[test]
+    fn rejects_non_loopback_host_service_endpoint() {
+        let error = validate_host_service_endpoint("http://example.com:48937").unwrap_err();
+
+        assert!(error.to_string().contains("loopback"));
+    }
+
+    #[test]
+    fn rejects_host_service_endpoint_credentials() {
+        let error = validate_host_service_endpoint("http://user:pass@127.0.0.1:48937").unwrap_err();
+
+        assert!(error.to_string().contains("credentials"));
     }
 
     #[test]

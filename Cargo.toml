@@ -19,3 +19,4 @@ sha2 = "0.10"
 rusqlite = { version = "0.32", features = ["bundled"] }
 thiserror = "2"
 ureq = { version = "2", default-features = false }
+url = "2"
