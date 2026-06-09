@@ -1,6 +1,7 @@
 pub mod app;
 pub mod cli;
 pub mod config;
+pub mod host_service;
 pub mod registry;
 pub mod resolver;
 pub mod superset_cli;

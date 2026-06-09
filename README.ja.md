@@ -75,7 +75,7 @@ ssctl send --session <session-id> --stdin --force-unregistered-session --workspa
 ssctl close --session <session-id> --force-unregistered-session --workspace <workspace-id>
 ```
 
-`ssctl close`の既定のシグナルは`SIGHUP`です。対応するシグナルは`SIGHUP`、`SIGINT`、`SIGTERM`、`SIGKILL`です。登録済みの役割を終了した場合、pty-daemonが終了を確認した後にだけローカルの登録情報から役割を削除します。
+`ssctl close`の既定のシグナルは`SIGHUP`です。対応するシグナルは`SIGHUP`、`SIGINT`、`SIGTERM`、`SIGKILL`です。既定の終了ではSuperset host-serviceの端末ライフサイクルを使い、App上の端末もdisposeします。明示的に`SIGINT`、`SIGTERM`、`SIGKILL`を指定した場合はpty-daemonにそのシグナルを送った後、host-serviceでApp側の端末状態をdisposeします。登録済みの役割を終了した場合、App側の終了処理が成功した後にだけローカルの登録情報から役割を削除します。
 
 ## 状態ファイル
 
@@ -85,16 +85,17 @@ ssctl close --session <session-id> --force-unregistered-session --workspace <wor
 | `.ssctl/registry.lock` | registry の読み書きだけを保護する短命のロックです。 |
 | `.ssctl/` | `ssctl` のローカル実行状態を保持します。 |
 | `.agent-results/` | `ssctl report`が作成した報告の写しを保存します。 |
+| `~/.superset/host/<organization-id>/manifest.json` | host-serviceのendpointと認証情報を記録します。`close`でApp側の端末ライフサイクルに接続するために読み取ります。 |
 | `~/.superset/host/<organization-id>/pty-daemon-manifest.json` | pty-daemonソケットと対応する通信仕様の版を記録します。 |
 | `~/.superset/host/<organization-id>/host.db` | ptyセッションにワークスペースとライフサイクルの付帯情報を付与するためのSupersetホストデータベースです。 |
-| 定義ファイルに記録されたpty-daemonソケット | 既存セッションの確認、書き込み、終了に使うUnixソケットです。 |
+| 定義ファイルに記録されたpty-daemonソケット | 既存セッションの確認、書き込み、明示シグナル指定時の終了に使うUnixソケットです。 |
 
 ローカルの登録情報は、原子的な書き込み、`0600`のファイル権限、古いセッションの整理、未登録セッションへの強制送信に対する監査ログ記録を使います。
 
 ## 安全上の注意
 
 - 公開Superset操作には公開Supersetコマンドラインツールを使います。
-- 非公開のpty-daemon接続処理の用途は、既存セッションの確認、書き込み、終了に限定します。
+- 非公開のpty-daemon接続処理の用途は、既存セッションの確認、書き込み、明示シグナル指定時の終了に限定します。
 - 通常の送信と終了は、登録情報で検証されたセッションのみを対象にします。
 - 未登録セッションへ送信または終了するには、`--force-unregistered-session`と`--workspace <workspace-id>`の両方が必要です。
 - 大きすぎるメッセージは、端末へ直接貼り付けず参照メッセージに変換します。

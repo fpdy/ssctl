@@ -46,10 +46,15 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Changed `ssctl close` to use Superset host-service `terminal.killSession`
+  for the default close path so terminal sessions are disposed in the App, not
+  only killed in the pty-daemon.
+- Explicit close signals still use the pty-daemon signal first, then call the
+  host-service lifecycle to dispose the App-side terminal state.
 - Moved existing-session inspection, sends, spawn verification, and close support
   onto the Superset pty-daemon runtime path.
-- Registered roles are removed from `.ssctl/registry.json` only after a close is
-  confirmed by the pty-daemon.
+- Registered roles are removed from `.ssctl/registry.json` only after the close
+  lifecycle succeeds.
 
 ## [0.1.0] - 2026-06-08
 

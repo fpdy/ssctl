@@ -14,6 +14,7 @@ use crate::cli::{
     SendArgs, SpawnArgs,
 };
 use crate::config::RuntimeConfig;
+use crate::host_service::HostServiceClient;
 use crate::registry::{
     ForceSendAuditEntry, PendingSpawnEntry, Registry, RegistryEntry, RegistryStore,
     cleanup_stale_pending_spawns, cleanup_stale_sessions, role_for_session, sha256_hex,
@@ -720,11 +721,25 @@ fn close_session(
         return Ok(output);
     }
 
-    client.close(&target.session_id, signal)?;
+    close_terminal_session(config, &runtime, &mut client, &target, signal)?;
 
     output.registry_updated = remove_registered_role_after_close(store, &target)?;
 
     Ok(output)
+}
+
+fn close_terminal_session(
+    config: &RuntimeConfig,
+    runtime: &SupersetHostRuntime,
+    client: &mut SupersetRuntimeClient,
+    target: &SessionTarget,
+    signal: &str,
+) -> Result<()> {
+    let host_service = HostServiceClient::connect(&config.superset_home, runtime)?;
+    if signal != "SIGHUP" {
+        client.close(&target.session_id, signal)?;
+    }
+    host_service.kill_session(&target.session_id, &target.workspace_id)
 }
 
 fn touch_registered_role(store: &RegistryStore, role: &str, session_id: &str) -> Result<bool> {
